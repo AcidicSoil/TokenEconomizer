@@ -29,6 +29,21 @@
                                       with `history_import=on`, the first session start runs
                                       it by itself)
     te history [import --status]      what that import did here
+    te corpus inspect --database DB  inspect existing ABPT conversation archive
+    te corpus import --database DB --project ID   replay one ABPT project's history
+    te corpus sync --project ID     rebuild after source revisions only
+    te corpus context --project ID [--query WORDS]  cited historical context
+    te corpus workflows --project ID    inspect observed procedure candidates
+    te corpus workflow show ID --project PROJECT   inspect candidate's source steps
+    te corpus workflow approve ID --project PROJECT --evidence-digest DIGEST
+        --steps-file procedure.json --reason TEXT   record explicit reviewed steps
+    te corpus workflow reject ID --project PROJECT --evidence-digest DIGEST
+        --reason TEXT                             reject a proposed procedure
+    te corpus workflow reviews --project PROJECT   list decisions and stale reviews
+    te corpus workflow search --project PROJECT --query KEYWORDS
+                                                 find approved procedures only
+    te corpus workflow evaluate --project PROJECT --cases-file CASES.json
+                                                 score labelled retrieval quality
     te repos                          every repository with state here: how it was identified,
                                       its agents and sessions, the checkouts seen
     te repos migrate                  send state recorded under earlier keys where it belongs
@@ -767,6 +782,114 @@ def cmd_judge(args):
     return 0
 
 
+def cmd_corpus(args):
+    """Inspect, replay, or retrieve ABPT-derived historical evidence without model calls."""
+    import sqlite3
+
+    from . import corpus
+
+    try:
+        if args.action == "inspect":
+            if not args.database:
+                raise ValueError("--database is required for inspect")
+            result = corpus.inspect(args.database, args.project)
+        elif args.action == "status":
+            if not args.project:
+                raise ValueError("--project is required for status")
+            result = corpus._scope(args.project).read("current.json") or {
+                "state": "not_imported"
+            }
+        elif args.action == "context":
+            if not args.project:
+                raise ValueError("--project is required for context")
+            result = corpus.context(args.project, query=args.query, limit=args.count)
+        elif args.action == "workflows":
+            if not args.project:
+                raise ValueError("--project is required for workflows")
+            result = corpus.workflow_candidates(args.project, limit=args.count)
+        elif args.action == "workflow":
+            if not args.project:
+                raise ValueError("workflow requires --project")
+            if args.workflow_action == "reviews":
+                result = corpus.workflow_reviews(args.project)
+            elif args.workflow_action == "evaluate" and not args.workflow_id:
+                if not args.cases_file:
+                    raise ValueError("workflow evaluate requires --cases-file")
+                from pathlib import Path
+                from .workflow_evaluation import evaluate_project
+
+                labels = json.loads(Path(args.cases_file).read_text(encoding="utf-8"))
+                result = evaluate_project(
+                    args.project, labels, limit=args.count
+                )
+            elif args.workflow_action == "search" and not args.workflow_id:
+                result = corpus.workflow_search(
+                    args.project, args.query, limit=args.count
+                )
+            elif args.workflow_action == "show" and args.workflow_id:
+                result = corpus.workflow_detail(args.project, args.workflow_id)
+            elif args.workflow_action in ("approve", "reject") and args.workflow_id:
+                if not args.reason or not args.evidence_digest:
+                    raise ValueError("review requires --reason and --evidence-digest")
+                steps = None
+                if args.workflow_action == "approve":
+                    if not args.steps_file:
+                        raise ValueError("approval requires --steps-file")
+                    from pathlib import Path
+
+                    steps = json.loads(
+                        Path(args.steps_file).read_text(encoding="utf-8")
+                    )
+                elif args.steps_file:
+                    raise ValueError("rejection does not accept --steps-file")
+                result = corpus.review_workflow(
+                    args.project, args.workflow_id,
+                    {"approve": "approved", "reject": "rejected"}[args.workflow_action],
+                    args.evidence_digest, args.reason, approved_steps=steps,
+                )
+            else:
+                raise ValueError("workflow requires show, reviews, search, evaluate, approve, or reject")
+        else:
+            if not args.project:
+                raise ValueError("--project is required for import/sync")
+            existing = corpus._scope(args.project).read("current.json") or {}
+            database = args.database or (
+                existing.get("source") if args.action == "sync" else None
+            )
+            if not database:
+                raise ValueError("--database is required for the first import")
+            if args.dry_run:
+                result = corpus.inspect(database, args.project)
+                result["dry_run"] = True
+            else:
+                repo = args.repo or (
+                    (existing.get("repo") or {}).get("path")
+                    if args.action == "sync"
+                    else None
+                )
+                data_root = args.data_root or (
+                    existing.get("data_root") if args.action == "sync" else None
+                )
+                limit = (
+                    args.limit
+                    if args.limit is not None
+                    else (existing.get("limit") if args.action == "sync" else None)
+                )
+                result = corpus.import_project(
+                    database, args.project, repo=repo, data_root=data_root, limit=limit
+                )
+        if args.json:
+            print(json.dumps(result, indent=2))
+        elif args.action == "context":
+            print(corpus.format_context(result))
+        else:
+            print(json.dumps(result, indent=2))
+        return 0
+    except (OSError, TypeError, ValueError, RuntimeError, sqlite3.DatabaseError) as error:
+        print(f"te corpus: {error}", file=sys.stderr)
+        return 1
+
+
 # ---- repos ----------------------------------------------------------------------------------
 def _when(ts):
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts else "-"
@@ -1038,6 +1161,44 @@ def build_parser():
     p = add("repomap")
     p.add_argument("action", nargs="?", default="show", choices=("show", "refresh"))
     p.set_defaults(fn=cmd_repomap)
+    p = add("corpus")
+    p.add_argument(
+        "action",
+        choices=(
+            "inspect",
+            "import",
+            "sync",
+            "status",
+            "context",
+            "workflows",
+            "workflow",
+        ),
+    )
+    p.add_argument(
+        "workflow_action", nargs="?",
+        choices=("show", "reviews", "search", "evaluate", "approve", "reject"),
+    )
+    p.add_argument("workflow_id", nargs="?")
+    p.add_argument("--reason", help="explicit reviewer rationale")
+    p.add_argument("--evidence-digest", help="inspected candidate evidence fingerprint")
+    p.add_argument("--steps-file", help="JSON array of reviewed steps for approval")
+    p.add_argument("--cases-file", help="JSON file of independently labelled relevance queries")
+    p.add_argument("--database", help="path to ABPT's existing local-chatgpt.db")
+    p.add_argument("--project", help="explicit ABPT project ID")
+    p.add_argument(
+        "--repo", help="explicit existing git checkout to bind to this project"
+    )
+    p.add_argument(
+        "--data-root", help="ABPT runs directory containing canonical snapshots"
+    )
+    p.add_argument("--query", help="keywords for evidence or approved-workflow search")
+    p.add_argument("--count", type=int, default=6, help="maximum search results")
+    p.add_argument(
+        "--limit", type=int, help="maximum conversations for a partial import"
+    )
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_corpus)
     p = add("probe")
     p.add_argument("--sessions", type=int, default=6)
     p.add_argument("--model", default=None)

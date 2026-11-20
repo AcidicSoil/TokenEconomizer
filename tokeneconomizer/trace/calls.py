@@ -9,9 +9,11 @@ session are converted into one of these first (`codex.codex_rollout_to_exec`,
 import os
 import re
 
+from .abpt import abpt_calls
 from .claude import claude_calls
 from .codex import codex_exec_calls
 from .copilot import copilot_event_calls, copilot_session_cwd
+from .jsonl import lines as _lines
 
 # rtk in its Codex mode changes the COMMAND LINE rather than hooking it: the agent is told to
 # type `rtk pytest`, `rtk git status`, `rtk proxy <cmd>`. Every classifier that reads a
@@ -31,6 +33,10 @@ def _is_codex_exec(lines):
     return any('"type":"item.completed"' in line.replace(" ", "") for line in lines)
 
 
+def _is_abpt(lines):
+    return any('"type":"abpt_tool_call"' in line.replace(" ", "") for line in lines)
+
+
 def load_trajectory(path):
     """Ordered [(tool_name, args, result_text, success)] over a saved session log.
 
@@ -38,9 +44,11 @@ def load_trajectory(path):
     envelopes carrying `tool_use` blocks, and anything else is read as Copilot events."""
     if not os.path.exists(path):
         return []
-    lines = [l.strip() for l in open(path, encoding="utf-8", errors="replace") if l.strip()]
+    lines = list(_lines(path))
     if _is_codex_exec(lines):
         return codex_exec_calls(lines)
+    if _is_abpt(lines):
+        return list(abpt_calls(lines))
     if any('"tool_use"' in line or '"type": "assistant"' in line or '"type":"assistant"' in line
            for line in lines):
         return [c[:4] for c in claude_calls(lines)]
@@ -57,8 +65,8 @@ def call_cwds(path):
     calls = load_trajectory(path)
     if not calls or not os.path.exists(path):
         return [None] * len(calls)
-    lines = [l.strip() for l in open(path, encoding="utf-8", errors="replace") if l.strip()]
-    if _is_codex_exec(lines):
+    lines = list(_lines(path))
+    if _is_codex_exec(lines) or _is_abpt(lines):
         return [None] * len(calls)
     cwds = [c[4] for c in claude_calls(lines)]
     if len(cwds) == len(calls):
